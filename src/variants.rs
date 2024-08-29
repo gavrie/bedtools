@@ -77,7 +77,7 @@ impl Variants {
             COMMIT;
 
             SELECT
-                zstd_enable_transparent('{"table": "variants", "column": "info", "compression_level": 19, "dict_chooser": "''a''"}');
+                zstd_enable_transparent('{"table": "variants", "column": "info", "compression_level": 3, "dict_chooser": "''a''"}');
 
             -- How should we combine compression and insertion?
             -- Probably need to interleave this with 1000s of insertions.
