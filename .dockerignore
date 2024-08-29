@@ -1,5 +1,7 @@
 .vscode
 /target
 *.db
+*.db-shm
+*.db-wal
 *.vcf.gz
 *.vcf.gz.tbi
