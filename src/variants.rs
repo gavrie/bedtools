@@ -26,6 +26,16 @@ impl Variants {
         let conn = Connection::open(db)
             .with_context(|| format!("Failed to open database: {}", db.display()))?;
 
+        // FIXME: Don't hardcode path
+        const ZSTD_EXTENSION_PATH: &str =
+            "/Users/gavrie/source/third_party/sqlite-zstd/target/release/libsqlite_zstd";
+
+        unsafe {
+            let _guard = rusqlite::LoadExtensionGuard::new(&conn)?;
+            conn.load_extension(ZSTD_EXTENSION_PATH, None)
+                .context("Failed to load libsqlite_zstd extension")?;
+        }
+
         eprintln!("Opened database: {}", db.display());
         Ok(Self { conn })
     }
@@ -35,13 +45,19 @@ impl Variants {
 
         eprintln!("Importing VCF: {}", vcf_in.display());
 
-        conn.execute_batch(
-            /*
-               https://kerkour.com/sqlite-for-servers
-            */
-            "BEGIN;
+        // See: https://kerkour.com/sqlite-for-servers
 
-             CREATE TABLE IF NOT EXISTS variants (
+        conn.execute_batch(
+            r#"
+            -- Recommended by zstd:
+            PRAGMA journal_mode=WAL;
+            PRAGMA auto_vacuum=full;
+            PRAGMA busy_timeout=2000;
+
+            BEGIN;
+
+            CREATE TABLE IF NOT EXISTS variants (
+                xrowid INTEGER PRIMARY KEY,
                 chrom TEXT,
                 pos INTEGER,
                 id TEXT,
@@ -58,7 +74,22 @@ impl Variants {
 
             CREATE INDEX IF NOT EXISTS idx_variants_chrom_pos ON variants (chrom, pos);
 
-            COMMIT;",
+            COMMIT;
+
+            SELECT
+                zstd_enable_transparent('{"table": "variants", "column": "info", "compression_level": 19, "dict_chooser": "''a''"}');
+
+            -- How should we combine compression and insertion?
+            -- Probably need to interleave this with 1000s of insertions.
+
+            -- Compress everything as fast as possible:
+            SELECT zstd_incremental_maintenance(NULL, 1);
+
+            -- Spend 60 seconds compressing pending stuff, while allowing other queries to run 50% of the time.
+            -- SELECT zstd_incremental_maintenance(60, 0.5);
+
+
+            "#,
         )?;
 
         let mut reader = vcf::io::reader::Builder::default()
@@ -105,6 +136,9 @@ impl Variants {
             }
         }
         tx.commit()?;
+
+        // TODO: Batch the tranaction into 1000s of insertions and compress in between.
+        conn.execute("SELECT zstd_incremental_maintenance(NULL, 1);", [])?;
 
         conn.execute("ANALYZE", [])?;
 
