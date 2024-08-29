@@ -100,50 +100,51 @@ impl Variants {
         store_header(&header, conn)?;
 
         let before = Instant::now();
-        let tx = conn.transaction()?;
-        {
-            let mut stmt = tx.prepare(
-                "INSERT INTO variants
-                    (chrom, pos, id, ref, alt, qual, filter, info)
-                 VALUES
-                    (:chrom, :pos, :id, :ref, :alt, :qual, :filter, :info)",
-            )?;
+        let mut records_processed = 0;
 
-            for result in reader.records() {
-                let record = result?;
+        const SQL: &str = "
+            INSERT INTO variants
+                (chrom, pos, id, ref, alt, qual, filter, info)
+            VALUES
+                (:chrom, :pos, :id, :ref, :alt, :qual, :filter, :info)
+            ";
 
-                let pos: Option<usize> = record.variant_start().transpose()?.map(usize::from);
-                let ids = record.ids();
-                let id: Option<&str> = ids.iter().next(); // Take only first ID (if any)
-                let qual: Option<f32> = record.quality_score().transpose()?;
+        const BATCH_SIZE: usize = 10_000;
 
-                // // TODO: Store INFO in a separate table
-                // let info = record.info();
-                // let info: Vec<Result<_, _>> = info.iter(&header).collect();
-                // let info: std::io::Result<Vec<_>> = info.into_iter().collect();
-                // let _info = info?;
+        let mut records = reader.records();
+        let mut done = false;
 
-                stmt.execute(named_params! {
-                    ":chrom": record.reference_sequence_name(),
-                    ":pos": pos,
-                    ":id": id,
-                    ":ref": record.reference_bases(),
-                    ":alt": record.alternate_bases().as_ref(),
-                    ":qual": qual,
-                    ":filter": record.filters().as_ref(),
-                    ":info": record.info().as_ref(),
-                })?;
+        while !done {
+            // Process a batch of records
+            let tx = conn.transaction()?;
+            {
+                let mut stmt = tx.prepare(SQL)?;
+
+                for _ in 0..BATCH_SIZE {
+                    if let Some(result) = records.next() {
+                        let record = result?;
+                        records_processed += 1;
+                        execute_record(record, &mut stmt)?;
+                    } else {
+                        done = true;
+                        break;
+                    }
+                }
+
+                let _: usize = tx
+                    .query_row("SELECT zstd_incremental_maintenance(NULL, 1)", [], |row| {
+                        row.get(0)
+                    })
+                    .context("Compress")?;
             }
-        }
-        tx.commit()?;
+            tx.commit()?;
 
-        // TODO: Batch the tranaction into 1000s of insertions and compress in between.
-        conn.execute("SELECT zstd_incremental_maintenance(NULL, 1);", [])?;
+            conn.execute("VACUUM", []).context("Vacuum")?;
+            eprintln!("Records processed: {records_processed}");
+        }
 
         conn.execute("ANALYZE", [])?;
-
         eprintln!("Import took {:.2?}", before.elapsed());
-
         Ok(())
     }
 
@@ -223,6 +224,29 @@ impl Variants {
 
         Ok(())
     }
+}
+
+fn execute_record(
+    record: vcf::Record,
+    stmt: &mut rusqlite::Statement<'_>,
+) -> Result<(), anyhow::Error> {
+    let pos: Option<usize> = record.variant_start().transpose()?.map(usize::from);
+    let ids = record.ids();
+    let id: Option<&str> = ids.iter().next();
+    let qual: Option<f32> = record.quality_score().transpose()?;
+
+    stmt.execute(named_params! {
+        ":chrom": record.reference_sequence_name(),
+        ":pos": pos,
+        ":id": id,
+        ":ref": record.reference_bases(),
+        ":alt": record.alternate_bases().as_ref(),
+        ":qual": qual,
+        ":filter": record.filters().as_ref(),
+        ":info": record.info().as_ref(),
+    })?;
+
+    Ok(())
 }
 
 fn parse_info(info: &str, header: &vcf::Header) -> Result<record_buf::Info> {
